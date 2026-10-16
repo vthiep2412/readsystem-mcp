@@ -193,6 +193,13 @@ async function resolveUnicodeEquivalentPath(
   return currentPath;
 }
 
+const validatedPathCache = new Map<string, { result: string; timestamp: number }>();
+const CACHE_TTL_MS = 5000;
+
+export function clearValidatedPathCache(): void {
+  validatedPathCache.clear();
+}
+
 // The allow-list is passed in rather than read from module state, so each
 // server instance (see server.ts) validates against its own directories and two
 // instances can coexist in one process (#4854).
@@ -200,6 +207,12 @@ export async function validatePath(
   requestedPath: string,
   allowedDirectories: readonly string[],
 ): Promise<string> {
+  const cacheKey = `${requestedPath}:::${allowedDirectories.join(";")}`;
+  const cached = validatedPathCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.result;
+  }
+
   const expandedPath = expandHome(requestedPath);
   // Do not silently reinterpret a Windows drive path as a relative POSIX path.
   // This would create a literal filename such as `C:\\Users\\...` inside the
@@ -249,6 +262,11 @@ export async function validatePath(
         `Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(", ")}`,
       );
     }
+    if (validatedPathCache.size >= 500) {
+      const oldestKey = validatedPathCache.keys().next().value;
+      if (oldestKey) validatedPathCache.delete(oldestKey);
+    }
+    validatedPathCache.set(cacheKey, { result: realPath, timestamp: Date.now() });
     return realPath;
   } catch (error) {
     // Security: For new files that don't exist yet, verify parent directory
@@ -652,36 +670,240 @@ export async function searchFilesWithValidation(
   const { excludePatterns = [] } = options;
   const results: string[] = [];
 
+  // Precompile glob patterns to RegExp objects to avoid recompiling on every entry
+  const patternRe = minimatch.makeRe(pattern, { dot: true });
+  const excludeRes = excludePatterns
+    .map((p) => minimatch.makeRe(p, { dot: true }))
+    .filter((re): re is RegExp => Boolean(re));
+
   async function search(currentPath: string) {
     const entries = await fs.readdir(currentPath, { withFileTypes: true });
 
+    const subdirs: string[] = [];
     for (const entry of entries) {
       const fullPath = path.join(currentPath, entry.name);
 
       try {
-        await validatePath(fullPath, allowedDirectories);
+        const rawRelative = path.relative(rootPath, fullPath);
+        const relativePath = path.sep === "\\" ? rawRelative.replace(/\\/g, "/") : rawRelative;
 
-        const relativePath = path.relative(rootPath, fullPath);
-        const shouldExclude = excludePatterns.some((excludePattern) =>
-          minimatch(relativePath, excludePattern, { dot: true }),
-        );
-
+        const shouldExclude = excludeRes.some((re) => re.test(relativePath));
         if (shouldExclude) continue;
 
-        // Use glob matching for the search pattern
-        if (minimatch(relativePath, pattern, { dot: true })) {
+        if (typeof entry.isSymbolicLink === "function" && entry.isSymbolicLink()) {
+          const real = await fs.realpath(fullPath);
+          if (!isPathWithinAllowedDirectories(normalizePath(real), allowedDirectories)) {
+            continue;
+          }
+        }
+
+        if (patternRe && patternRe.test(relativePath)) {
           results.push(fullPath);
         }
 
         if (entry.isDirectory()) {
-          await search(fullPath);
+          subdirs.push(fullPath);
         }
       } catch {
         continue;
       }
     }
+
+    if (subdirs.length > 0) {
+      await Promise.all(subdirs.map((subdir) => search(subdir)));
+    }
   }
 
   await search(rootPath);
   return results;
+}
+
+export interface GrepOptions {
+  isRegex?: boolean;
+  caseSensitive?: boolean;
+  maxMatches?: number;
+  includeGlobs?: string[];
+  excludePatterns?: string[];
+}
+
+export interface GrepMatch {
+  filePath: string;
+  lineNumber: number;
+  lineContent: string;
+}
+
+export async function grepFilesContent(
+  rootPath: string,
+  pattern: string,
+  allowedDirectories: readonly string[],
+  options: GrepOptions = {},
+): Promise<GrepMatch[]> {
+  const {
+    isRegex = true,
+    caseSensitive = true,
+    maxMatches = 100,
+    includeGlobs = [],
+    excludePatterns = [],
+  } = options;
+
+  let matcher: RegExp;
+  try {
+    if (isRegex) {
+      matcher = new RegExp(pattern, caseSensitive ? "" : "i");
+    } else {
+      const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      matcher = new RegExp(escaped, caseSensitive ? "" : "i");
+    }
+  } catch (err) {
+    throw new Error(
+      `Invalid regular expression pattern: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+
+  const excludeRes = excludePatterns
+    .map((p) => minimatch.makeRe(p, { dot: true }))
+    .filter((re): re is RegExp => Boolean(re));
+
+  const includeRes = includeGlobs
+    .map((p) => minimatch.makeRe(p, { dot: true }))
+    .filter((re): re is RegExp => Boolean(re));
+
+  const matches: GrepMatch[] = [];
+  const visitedCanonicalDirs = new Set<string>();
+
+  async function searchFile(filePath: string): Promise<boolean> {
+    try {
+      const buffer = await fs.readFile(filePath);
+      const sample = buffer.subarray(0, Math.min(512, buffer.length));
+      if (sample.includes(0)) {
+        return false;
+      }
+
+      const text = buffer.toString("utf-8");
+      if (!matcher.test(text)) {
+        return false;
+      }
+
+      let lineStart = 0;
+      let lineNum = 1;
+      while (lineStart < text.length) {
+        let lineEnd = text.indexOf("\n", lineStart);
+        if (lineEnd === -1) {
+          lineEnd = text.length;
+        }
+        let line = text.slice(lineStart, lineEnd);
+        if (line.endsWith("\r")) {
+          line = line.slice(0, -1);
+        }
+
+        const match = matcher.exec(line);
+        if (match) {
+          let lineContent = line;
+          if (line.length > 200) {
+            const matchIdx = match.index;
+            const start = Math.max(0, matchIdx - 50);
+            const end = Math.min(line.length, matchIdx + 150);
+            lineContent = `${start > 0 ? "..." : ""}${line.slice(start, end)}${end < line.length ? "..." : ""}`;
+          }
+
+          matches.push({
+            filePath,
+            lineNumber: lineNum,
+            lineContent,
+          });
+          if (matches.length >= maxMatches) {
+            return true;
+          }
+        }
+
+        lineStart = lineEnd + 1;
+        lineNum++;
+      }
+    } catch {
+      // Ignore unreadable files
+    }
+
+    return false;
+  }
+
+  async function traverse(currentPath: string): Promise<boolean> {
+    if (matches.length >= maxMatches) return true;
+
+    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+    const subdirs: string[] = [];
+    const filesToRead: string[] = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+
+      try {
+        const rawRelative = path.relative(rootPath, fullPath);
+        const relativePath = path.sep === "\\" ? rawRelative.replace(/\\/g, "/") : rawRelative;
+
+        const shouldExclude = excludeRes.some((re) => re.test(relativePath));
+        if (shouldExclude) continue;
+
+        // Path validation: symlinks require realpath verification, non-symlinks within allowed directories are verified fast
+        if (typeof entry.isSymbolicLink === "function" && entry.isSymbolicLink()) {
+          const real = await fs.realpath(fullPath);
+          if (!isPathWithinAllowedDirectories(normalizePath(real), allowedDirectories)) {
+            continue;
+          }
+          const stat = await fs.stat(real);
+          if (stat.isDirectory()) {
+            if (visitedCanonicalDirs.has(real)) {
+              continue;
+            }
+            visitedCanonicalDirs.add(real);
+            subdirs.push(fullPath);
+          } else if (stat.isFile()) {
+            if (includeRes.length === 0 || includeRes.some((re) => re.test(relativePath))) {
+              filesToRead.push(fullPath);
+            }
+          }
+        } else if (entry.isDirectory()) {
+          subdirs.push(fullPath);
+        } else if (entry.isFile()) {
+          if (includeRes.length === 0 || includeRes.some((re) => re.test(relativePath))) {
+            filesToRead.push(fullPath);
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    // Process files in batches for concurrency without blocking the event loop
+    const BATCH_SIZE = 64;
+    for (let i = 0; i < filesToRead.length; i += BATCH_SIZE) {
+      const batch = filesToRead.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map((f) => searchFile(f)));
+      if (matches.length >= maxMatches) {
+        return true;
+      }
+    }
+
+    if (subdirs.length > 0) {
+      await Promise.all(subdirs.map((subdir) => traverse(subdir)));
+    }
+
+    return false;
+  }
+
+  try {
+    const stat = await fs.stat(rootPath);
+    if (stat.isFile()) {
+      await searchFile(rootPath);
+    } else {
+      const canonicalRoot = await fs.realpath(rootPath);
+      visitedCanonicalDirs.add(canonicalRoot);
+      await traverse(rootPath);
+    }
+  } catch {
+    // Return empty matches for non-existent root path
+    return [];
+  }
+
+  return matches.slice(0, maxMatches);
 }
