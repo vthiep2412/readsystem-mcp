@@ -46,6 +46,8 @@ const TOOL_NAMES = [
   "get_file_info",
   "grep_search",
   "list_allowed_directories",
+  "get_file_line_endings",
+  "convert_line_endings",
 ];
 
 interface TreeEntry {
@@ -95,7 +97,7 @@ describe("server identity and tool list", () => {
     });
   });
 
-  it("lists the 7 tools in registration order", async () => {
+  it("lists the 9 tools in registration order", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name)).toEqual(TOOL_NAMES);
   });
@@ -121,6 +123,15 @@ describe("server identity and tool list", () => {
       list_allowed_directories: {
         title: "List Allowed Directories",
         ...readOnly,
+      },
+      get_file_line_endings: {
+        title: "Get File Line Endings",
+        ...readOnly,
+      },
+      convert_line_endings: {
+        title: "Convert Line Endings",
+        readOnlyHint: false,
+        openWorldHint: false,
       },
     });
   });
@@ -208,6 +219,8 @@ describe("server identity and tool list", () => {
       ["get_file_info", { path: path.join(dir, "a.txt") }],
       ["grep_search", { path: dir, pattern: "alpha" }],
       ["list_allowed_directories", {}],
+      ["get_file_line_endings", { path: path.join(dir, "a.txt") }],
+      ["convert_line_endings", { path: path.join(dir, "a.txt"), target: "lf" }],
     ];
     for (const [name, args] of calls) {
       const result = await call(client, name, args);

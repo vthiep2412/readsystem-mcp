@@ -22,6 +22,8 @@ import {
   searchFilesWithValidation,
   grepFilesContent,
   clearValidatedPathCache,
+  getFileLineEndingsText,
+  convertFileLineEndingsText,
 } from "./lib.js";
 import { SERVER_VERSION } from "./version.js";
 
@@ -99,6 +101,27 @@ const GrepSearchArgsSchema = z.object({
 
 const GetFileInfoArgsSchema = z.object({
   path: z.string(),
+});
+
+const GetFileLineEndingsArgsSchema = z.object({
+  path: z.string().describe("Path to the file or directory to check"),
+  recursive: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("Whether to check subdirectories recursively if path is a directory"),
+});
+
+const ConvertLineEndingsArgsSchema = z.object({
+  path: z.string().describe("Path to the file or directory to convert"),
+  target: z
+    .enum(["lf", "crlf"])
+    .describe("Target line ending format ('lf' or 'crlf')"),
+  recursive: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("Whether to convert files in subdirectories recursively if path is a directory"),
 });
 
 /**
@@ -499,7 +522,8 @@ export function createServer(
               .map((m) => {
                 const rawRel = path.relative(validPath, m.filePath);
                 const rel =
-                  path.sep === "\\" ? rawRel.replace(/\\/g, "/") : rawRel;
+                  (path.sep === "\\" ? rawRel.replace(/\\/g, "/") : rawRel) ||
+                  path.basename(m.filePath);
                 return `${rel}:${m.lineNumber}: ${m.lineContent}`;
               })
               .join("\n")
@@ -523,6 +547,53 @@ export function createServer(
     },
     async () => {
       const text = `Allowed directories:\n${allowedDirectories.join("\n")}`;
+      return {
+        content: [{ type: "text" as const, text }],
+        structuredContent: { content: text },
+      };
+    },
+  );
+
+  server.registerTool(
+    "get_file_line_endings",
+    {
+      title: "Get File Line Endings",
+      description:
+        "Check line ending format (CRLF, LF, mixed, or none) of a file or directory.",
+      inputSchema: jsonSchema2020(GetFileLineEndingsArgsSchema.shape),
+      outputSchema: jsonSchema2020({ content: z.string() }),
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (args: z.infer<typeof GetFileLineEndingsArgsSchema>) => {
+      const validPath = await validatePath(args.path, allowedDirectories);
+      const text = await getFileLineEndingsText(validPath, allowedDirectories, {
+        recursive: args.recursive,
+      });
+      return {
+        content: [{ type: "text" as const, text }],
+        structuredContent: { content: text },
+      };
+    },
+  );
+
+  server.registerTool(
+    "convert_line_endings",
+    {
+      title: "Convert Line Endings",
+      description:
+        "Convert line endings of a file or directory to LF or CRLF without modifying binary files.",
+      inputSchema: jsonSchema2020(ConvertLineEndingsArgsSchema.shape),
+      outputSchema: jsonSchema2020({ content: z.string() }),
+      annotations: { readOnlyHint: false, openWorldHint: false },
+    },
+    async (args: z.infer<typeof ConvertLineEndingsArgsSchema>) => {
+      const validPath = await validatePath(args.path, allowedDirectories);
+      const text = await convertFileLineEndingsText(
+        validPath,
+        args.target,
+        allowedDirectories,
+        { recursive: args.recursive },
+      );
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },

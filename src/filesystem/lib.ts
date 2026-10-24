@@ -311,12 +311,15 @@ export async function readFileContent(
 
 export async function writeFileContent(
   filePath: string,
-  content: string,
+  content: string | Buffer,
 ): Promise<void> {
   try {
     // Security: 'wx' flag ensures exclusive creation - fails if file/symlink exists,
     // preventing writes through pre-existing symlinks
-    await fs.writeFile(filePath, content, { encoding: "utf-8", flag: "wx" });
+    await fs.writeFile(filePath, content, {
+      encoding: typeof content === "string" ? "utf-8" : undefined,
+      flag: "wx",
+    });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       await overwriteInPlace(filePath, content);
@@ -351,7 +354,7 @@ export async function writeFileContent(
  */
 async function overwriteInPlace(
   filePath: string,
-  content: string,
+  content: string | Buffer,
 ): Promise<void> {
   const expected = await fs.lstat(filePath);
   if (!expected.isFile()) {
@@ -375,7 +378,11 @@ async function overwriteInPlace(
       );
     }
     await handle.truncate(0);
-    await handle.writeFile(content, "utf-8");
+    if (typeof content === "string") {
+      await handle.writeFile(content, "utf-8");
+    } else {
+      await handle.writeFile(content);
+    }
   } finally {
     await handle.close();
   }
@@ -830,7 +837,11 @@ export async function grepFilesContent(
   async function traverse(currentPath: string): Promise<boolean> {
     if (matches.length >= maxMatches) return true;
 
-    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+    const entries = await fs
+      .readdir(currentPath, { withFileTypes: true })
+      .catch(() => null);
+    if (!entries) return false;
+
     const subdirs: string[] = [];
     const filesToRead: string[] = [];
 
@@ -906,4 +917,348 @@ export async function grepFilesContent(
   }
 
   return matches.slice(0, maxMatches);
+}
+
+// Line Ending Types & Operations
+
+export type LineEndingType =
+  | "crlf"
+  | "lf"
+  | "mixed"
+  | "none (empty)"
+  | "none (binary)"
+  | "none";
+
+export interface LineEndingAnalysis {
+  type: LineEndingType;
+  crlfCount: number;
+  lfCount: number;
+  crCount: number;
+}
+
+export function analyzeBufferLineEndings(buffer: Buffer): LineEndingAnalysis {
+  if (buffer.length === 0) {
+    return { type: "none (empty)", crlfCount: 0, lfCount: 0, crCount: 0 };
+  }
+
+  const sample = buffer.subarray(0, Math.min(8000, buffer.length));
+  if (sample.includes(0)) {
+    return { type: "none (binary)", crlfCount: 0, lfCount: 0, crCount: 0 };
+  }
+
+  let crlfCount = 0;
+  let lfCount = 0;
+  let crCount = 0;
+
+  for (let i = 0; i < buffer.length; i++) {
+    const byte = buffer[i];
+    if (byte === 0x0d) {
+      if (i + 1 < buffer.length && buffer[i + 1] === 0x0a) {
+        crlfCount++;
+        i++;
+      } else {
+        crCount++;
+      }
+    } else if (byte === 0x0a) {
+      lfCount++;
+    }
+  }
+
+  if (crlfCount === 0 && lfCount === 0 && crCount === 0) {
+    return { type: "none", crlfCount: 0, lfCount: 0, crCount: 0 };
+  }
+
+  const kinds =
+    (crlfCount > 0 ? 1 : 0) + (lfCount > 0 ? 1 : 0) + (crCount > 0 ? 1 : 0);
+  if (kinds > 1) {
+    return { type: "mixed", crlfCount, lfCount, crCount };
+  }
+  if (crlfCount > 0) {
+    return { type: "crlf", crlfCount, lfCount, crCount };
+  }
+  if (lfCount > 0) {
+    return { type: "lf", crlfCount, lfCount, crCount };
+  }
+  return { type: "mixed", crlfCount, lfCount, crCount };
+}
+
+async function collectFilesToProcess(
+  rootPath: string,
+  allowedDirectories: readonly string[],
+  recursive: boolean,
+): Promise<string[]> {
+  const stat = await fs.stat(rootPath);
+  if (stat.isFile()) {
+    return [rootPath];
+  }
+
+  const visitedCanonicalDirs = new Set<string>();
+  try {
+    const canonicalRoot = await fs.realpath(rootPath);
+    visitedCanonicalDirs.add(canonicalRoot);
+  } catch {
+    // Ignore non-resolvable root path
+  }
+
+  const files: string[] = [];
+
+  async function traverse(currentDir: string): Promise<void> {
+    const entries = await fs
+      .readdir(currentDir, { withFileTypes: true })
+      .catch((err) => {
+        if (currentDir === rootPath) throw err;
+        return null;
+      });
+    if (!entries) return;
+    const subdirs: string[] = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      try {
+        if (typeof entry.isSymbolicLink === "function" && entry.isSymbolicLink()) {
+          const real = await fs.realpath(fullPath);
+          if (
+            !isPathWithinAllowedDirectories(
+              normalizePath(real),
+              allowedDirectories,
+            )
+          ) {
+            continue;
+          }
+          const targetStat = await fs.stat(real);
+          if (targetStat.isDirectory()) {
+            if (recursive) {
+              if (visitedCanonicalDirs.has(real)) continue;
+              visitedCanonicalDirs.add(real);
+              subdirs.push(fullPath);
+            }
+          } else if (targetStat.isFile()) {
+            files.push(fullPath);
+          }
+        } else if (entry.isDirectory()) {
+          if (recursive) {
+            subdirs.push(fullPath);
+          }
+        } else if (entry.isFile()) {
+          files.push(fullPath);
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (subdirs.length > 0) {
+      await Promise.all(subdirs.map((subdir) => traverse(subdir)));
+    }
+  }
+
+  await traverse(rootPath);
+  files.sort((a, b) => a.localeCompare(b));
+  return files;
+}
+
+export async function getFileLineEndingsText(
+  validPath: string,
+  allowedDirectories: readonly string[],
+  options: { recursive?: boolean } = {},
+): Promise<string> {
+  const stat = await fs.stat(validPath);
+  if (stat.isFile()) {
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(validPath);
+    } catch {
+      return `Failed to read ${validPath}: file could not be read`;
+    }
+    const analysis = analyzeBufferLineEndings(buffer);
+    let details = "";
+    if (analysis.type === "crlf") {
+      details = ` (${analysis.crlfCount} line endings)`;
+    } else if (analysis.type === "lf") {
+      details = ` (${analysis.lfCount} line endings)`;
+    } else if (analysis.type === "mixed") {
+      details = ` (${analysis.crlfCount} CRLF, ${analysis.lfCount} LF${
+        analysis.crCount > 0 ? `, ${analysis.crCount} CR` : ""
+      })`;
+    }
+    return `${validPath}: ${analysis.type}${details}`;
+  }
+
+  const files = await collectFilesToProcess(
+    validPath,
+    allowedDirectories,
+    options.recursive ?? false,
+  );
+
+  if (files.length === 0) {
+    return `Base: ${validPath}\nNo files found`;
+  }
+
+  const results: Array<{ path: string } & LineEndingAnalysis> = [];
+  const BATCH_SIZE = 64;
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map(async (filePath) => {
+        try {
+          const buffer = await fs.readFile(filePath);
+          const analysis = analyzeBufferLineEndings(buffer);
+          return { path: filePath, ...analysis };
+        } catch {
+          return null;
+        }
+      }),
+    );
+    for (const r of batchResults) {
+      if (r) results.push(r);
+    }
+  }
+
+  const lines = results.map((r) => {
+    const rawRel = path.relative(validPath, r.path);
+    const rel = path.sep === "\\" ? rawRel.replace(/\\/g, "/") : rawRel;
+    let details = "";
+    if (r.type === "crlf") details = ` (${r.crlfCount})`;
+    else if (r.type === "lf") details = ` (${r.lfCount})`;
+    else if (r.type === "mixed") details = ` (${r.crlfCount} CRLF, ${r.lfCount} LF)`;
+    return `${rel}: ${r.type}${details}`;
+  });
+
+  const crlfCount = results.filter((r) => r.type === "crlf").length;
+  const lfCount = results.filter((r) => r.type === "lf").length;
+  const mixedCount = results.filter((r) => r.type === "mixed").length;
+  const noneCount = results.filter((r) => r.type.startsWith("none")).length;
+  const failedCount = files.length - results.length;
+
+  const summary = [
+    "",
+    `Total: ${files.length} files (${crlfCount} CRLF, ${lfCount} LF, ${mixedCount} mixed, ${noneCount} none${
+      failedCount > 0 ? `, ${failedCount} failed` : ""
+    })`,
+  ];
+
+  return `Base: ${validPath}\n${lines.join("\n")}\n${summary.join("\n")}`;
+}
+
+export interface ConvertFileResult {
+  path: string;
+  status: "converted" | "unchanged" | "skipped_binary";
+  originalType: LineEndingType;
+}
+
+export async function convertFileLineEndingsText(
+  validPath: string,
+  target: "lf" | "crlf",
+  allowedDirectories: readonly string[],
+  options: { recursive?: boolean } = {},
+): Promise<string> {
+  const stat = await fs.stat(validPath);
+  const files = await collectFilesToProcess(
+    validPath,
+    allowedDirectories,
+    options.recursive ?? false,
+  );
+
+  if (files.length === 0) {
+    return stat.isFile()
+      ? `File not found: ${validPath}`
+      : `Base: ${validPath}\nNo files found`;
+  }
+
+  const results: ConvertFileResult[] = [];
+  for (const filePath of files) {
+    try {
+      const buffer = await fs.readFile(filePath);
+      const analysis = analyzeBufferLineEndings(buffer);
+
+      if (analysis.type === "none (binary)") {
+        results.push({
+          path: filePath,
+          status: "skipped_binary",
+          originalType: analysis.type,
+        });
+        continue;
+      }
+
+      if (
+        analysis.type === target ||
+        analysis.type === "none (empty)" ||
+        analysis.type === "none"
+      ) {
+        results.push({
+          path: filePath,
+          status: "unchanged",
+          originalType: analysis.type,
+        });
+        continue;
+      }
+
+      const text = buffer.toString("latin1");
+      const normalizedToLf = text.replace(/\r\n|\r/g, "\n");
+      const newText =
+        target === "crlf"
+          ? normalizedToLf.replace(/\n/g, "\r\n")
+          : normalizedToLf;
+
+      if (newText === text) {
+        results.push({
+          path: filePath,
+          status: "unchanged",
+          originalType: analysis.type,
+        });
+        continue;
+      }
+
+      await writeFileContent(filePath, Buffer.from(newText, "latin1"));
+      results.push({
+        path: filePath,
+        status: "converted",
+        originalType: analysis.type,
+      });
+    } catch {
+      // Ignore unreadable/unwritable files during batch
+    }
+  }
+
+  if (stat.isFile()) {
+    const r = results[0];
+    if (!r) {
+      return `Failed to convert ${validPath}: file could not be read or written`;
+    }
+    if (r.status === "converted") {
+      return `Converted ${r.path} to ${target.toUpperCase()} (was ${r.originalType})`;
+    } else if (r.status === "skipped_binary") {
+      return `Skipped binary file: ${r.path}`;
+    } else {
+      return `Unchanged: ${r.path} (${r.originalType})`;
+    }
+  }
+
+  const converted = results.filter((r) => r.status === "converted");
+  const unchanged = results.filter((r) => r.status === "unchanged");
+  const skipped = results.filter((r) => r.status === "skipped_binary");
+  const failedCount = files.length - results.length;
+
+  const lines: string[] = [];
+  if (converted.length > 0) {
+    lines.push(
+      `Converted ${converted.length} file(s) to ${target.toUpperCase()}:`,
+    );
+    for (const c of converted) {
+      const rawRel = path.relative(validPath, c.path);
+      const rel = path.sep === "\\" ? rawRel.replace(/\\/g, "/") : rawRel;
+      lines.push(`  [F] ${rel} (was ${c.originalType})`);
+    }
+  } else {
+    lines.push(`No files needed conversion.`);
+  }
+
+  const summary = [
+    "",
+    `Total: ${files.length} files (${converted.length} converted, ${unchanged.length} unchanged, ${skipped.length} binary skipped${
+      failedCount > 0 ? `, ${failedCount} failed` : ""
+    })`,
+  ];
+
+  return `Base: ${validPath}\n${lines.join("\n")}\n${summary.join("\n")}`;
 }
